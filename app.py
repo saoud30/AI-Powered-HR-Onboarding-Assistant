@@ -3,268 +3,275 @@ import streamlit as st
 import shutil
 from datetime import datetime
 from pypdf import PdfReader
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="IndiaSportsHub HR Assistant", layout="wide")
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+st.set_page_config(
+    page_title="IndiaSportsHub HR Assistant",
+    layout="wide"
+)
 
-# --- CONSTANTS ---
-# Confidence Threshold: Chroma uses L2 distance. 0 is perfect match. 
-# Higher than 1.2 usually means weak match.
-CONFIDENCE_THRESHOLD = 1.2 
+CONFIDENCE_THRESHOLD = 1.2  # Chroma L2 distance (lower = better)
 
-# --- CSS STYLING ---
+# --------------------------------------------------
+# LOAD API KEY FROM STREAMLIT SECRETS (DEPLOYMENT SAFE)
+# --------------------------------------------------
+if "GOOGLE_API_KEY" in st.secrets:
+    st.session_state.api_key = st.secrets["GOOGLE_API_KEY"]
+else:
+    st.error("GOOGLE_API_KEY not found in Streamlit secrets.")
+    st.stop()
+
+# --------------------------------------------------
+# STYLING
+# --------------------------------------------------
 st.markdown("""
 <style>
-    .main-header {font-size: 30px; font-weight: bold; color: #1f77b4;}
-    .category-tag {background-color: #e0e0e0; padding: 4px 10px; border-radius: 10px; font-size: 12px; color: #333; margin-bottom: 10px; display: inline-block;}
-    .source-box {background-color: #f9f9f9; padding: 10px; border-radius: 5px; margin-top: 10px; border-left: 4px solid #1f77b4;}
-    .score-badge {font-size: 10px; color: #666; font-style: italic;}
+.category-tag {
+    background-color: #e0e0e0;
+    padding: 4px 10px;
+    border-radius: 10px;
+    font-size: 12px;
+    color: #333;
+    display: inline-block;
+    margin-bottom: 8px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# --- INITIALIZATION ---
+# --------------------------------------------------
+# INITIALIZATION
+# --------------------------------------------------
 @st.cache_resource
 def initialize_embeddings():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 @st.cache_resource
-def initialize_llm(api_key):
+def initialize_llm():
     return ChatGoogleGenerativeAI(
-        model="gemini-flash-latest", # Using user's preference
-        google_api_key=api_key,
+        model="gemini-flash-latest",
+        google_api_key=st.session_state.api_key,
         temperature=0.1,
         safety_settings=None
     )
 
-# --- FEATURE 2: HYBRID QUERY CATEGORIZATION ---
-def get_query_category(query):
-    """Rule-based classification for control, before LLM reasoning."""
+# --------------------------------------------------
+# QUERY CATEGORIZATION (HYBRID CONTROL)
+# --------------------------------------------------
+def get_query_category(query: str):
     q = query.lower()
     if "leave" in q or "vacation" in q or "holiday" in q:
         return "Leave Policy"
-    elif "benefit" in q or "insurance" in q or "health" in q:
+    if "benefit" in q or "insurance" in q or "health" in q:
         return "Benefits"
-    elif "legal" in q or "law" in q or "compliance" in q:
-        return "Legal"
-    elif "remote" in q or "wfh" in q or "coffee" in q:
+    if "remote" in q or "wfh" in q or "coffee" in q:
         return "Remote Work"
+    if "legal" in q or "law" in q or "compliance" in q:
+        return "Legal"
     return "General HR"
 
-# --- DATA PROCESSING ---
+# --------------------------------------------------
+# DOCUMENT INGESTION
+# --------------------------------------------------
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+        reader = PdfReader(pdf)
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted
     return text
 
 def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200, length_function=len
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
     )
-    return text_splitter.split_text(text)
+    return splitter.split_text(text)
 
-def get_vector_store(text_chunks):
+def create_vector_store(chunks):
     embeddings = initialize_embeddings()
-    
-    # Create/Update Vector Store
     st.session_state.vector_store = Chroma.from_texts(
-        texts=text_chunks, 
+        texts=chunks,
         embedding=embeddings,
         persist_directory="./chroma_db_hr"
     )
     st.session_state.vector_store.persist()
-    
-    # --- FEATURE 4: ADMIN STATS ---
-    st.session_state.chunk_count = len(text_chunks)
+    st.session_state.chunk_count = len(chunks)
     st.session_state.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# --- RAG LOGIC (WITH THRESHOLD & TRANSPARENCY) ---
-def user_input(user_question):
+# --------------------------------------------------
+# RAG PIPELINE WITH SAFETY CONTROLS
+# --------------------------------------------------
+def answer_question(question: str):
     embeddings = initialize_embeddings()
-    
-    # Load DB
-    if os.path.exists("./chroma_db_hr"):
-        st.session_state.vector_store = Chroma(
-            persist_directory="./chroma_db_hr", 
-            embedding_function=embeddings
-        )
-    else:
-        return "Please upload HR documents in the Admin Dashboard first.", [], "Unknown"
 
-    # --- FEATURE 1 & 3: TRANSPARENCY & THRESHOLD ---
-    # similarity_search_with_score returns (Document, distance_score)
-    # Lower distance = better match.
-    retrieved_docs = st.session_state.vector_store.similarity_search_with_score(
-        user_question, k=3
+    if not os.path.exists("./chroma_db_hr"):
+        return (
+            "Please upload HR documents first.",
+            [],
+            "Unknown"
+        )
+
+    vector_store = Chroma(
+        persist_directory="./chroma_db_hr",
+        embedding_function=embeddings
     )
 
-    # Check Confidence Threshold (Feature 3)
-    # If the top result is too far away (distance > threshold), we refuse to answer.
-    top_score = retrieved_docs[0][1]
-    
+    retrieved = vector_store.similarity_search_with_score(question, k=3)
+    top_score = retrieved[0][1]
+
+    category = get_query_category(question)
+
+    # Confidence gate (hallucination prevention)
     if top_score > CONFIDENCE_THRESHOLD:
         return (
-            "I'm sorry, this information is not available in the HR documents (Confidence Score too low).", 
-            [], 
-            get_query_category(user_question)
+            "I'm sorry, the requested information is not available in the uploaded HR documents.",
+            [],
+            category
         )
 
-    # Prepare context manually to pass to LLM
-    context_text = "\n\n".join([doc.page_content for doc, score in retrieved_docs])
-    
-    # Generate Answer (Manual LLM call to have full control over context)
-    llm = initialize_llm(st.session_state.api_key)
-    
+    context = "\n\n".join([doc.page_content for doc, _ in retrieved])
+
     prompt = ChatPromptTemplate.from_template("""
-    You are a helpful HR Assistant for IndiaSportsHub. 
-    Answer strictly based on the context below.
-    
-    Context:
-    {context}
+You are an HR Assistant.
+Answer strictly using the context below.
+If the answer is not clearly present, say you do not have the information.
 
-    Question: {input}
+Context:
+{context}
 
-    Answer:
-    """)
-    
+Question:
+{question}
+
+Answer:
+""")
+
+    llm = initialize_llm()
     chain = prompt | llm
-    response = chain.invoke({"context": context_text, "input": user_question})
-    
-    return response.content, retrieved_docs, get_query_category(user_question)
+    response = chain.invoke({"context": context, "question": question})
 
-# --- MAIN APP ---
+    return response.content, retrieved, category
+
+# --------------------------------------------------
+# MAIN APP
+# --------------------------------------------------
 def main():
-    st.header("IndiaSportsHub - AI HR Onboarding Assistant 🤖")
+    st.header("IndiaSportsHub – AI HR Onboarding Assistant 🤖")
 
-    # SIDEBAR
+    # ---------------- SIDEBAR (ADMIN) ----------------
     with st.sidebar:
         st.title("Admin Dashboard")
-        
-        # --- ADMIN FEATURE: API KEY ---
-        api_key = st.text_input("Google API Key", type="password")
-        if api_key:
-            st.session_state.api_key = api_key
-            st.success("API Key saved")
-        
-        st.markdown("---")
+        st.success("API Key loaded securely")
 
-        # --- ADMIN FEATURE: STATS ---
+        st.markdown("---")
         st.subheader("Knowledge Base Stats")
-        if 'chunk_count' in st.session_state:
+
+        if "chunk_count" in st.session_state:
             st.metric("Indexed Chunks", st.session_state.chunk_count)
             st.caption(f"Last Updated: {st.session_state.last_updated}")
         else:
-            st.caption("No data indexed yet.")
+            st.caption("No documents indexed yet.")
 
-        # --- ADMIN FEATURE: DELETE DB ---
         if st.button("🗑️ Clear Knowledge Base"):
-            if os.path.exists("./chroma_db_hr"):
-                shutil.rmtree("./chroma_db_hr")
-                if 'chunk_count' in st.session_state: del st.session_state.chunk_count
-                st.success("Database cleared.")
-                st.rerun()
-        
-        st.markdown("---")
-        st.subheader("Upload Documents")
-        pdf_docs = st.file_uploader("Upload PDFs", accept_multiple_files=True, type=['pdf'])
-        if st.button("Process & Index"):
-            with st.spinner("Processing..."):
-                if pdf_docs and api_key:
-                    raw_text = get_pdf_text(pdf_docs)
-                    chunks = get_text_chunks(raw_text)
-                    get_vector_store(chunks)
-                    st.success(f"Indexed {len(chunks)} chunks.")
-                else:
-                    st.error("Please upload PDFs and enter API Key.")
+            shutil.rmtree("./chroma_db_hr", ignore_errors=True)
+            st.session_state.pop("chunk_count", None)
+            st.success("Knowledge base cleared.")
+            st.rerun()
 
-        # --- FEATURE 5: EVALUATION MODE ---
+        st.markdown("---")
+        st.subheader("Upload HR Policy PDFs")
+        pdf_docs = st.file_uploader(
+            "Upload PDFs",
+            type=["pdf"],
+            accept_multiple_files=True
+        )
+
+        if st.button("Process & Index"):
+            if not pdf_docs:
+                st.error("Please upload at least one PDF.")
+            else:
+                with st.spinner("Indexing documents..."):
+                    text = get_pdf_text(pdf_docs)
+                    chunks = get_text_chunks(text)
+                    create_vector_store(chunks)
+                    st.success(f"Indexed {len(chunks)} chunks.")
+
         st.markdown("---")
         eval_mode = st.checkbox("🧪 Enable Evaluation Mode")
         if eval_mode:
-            st.info("Running predefined test cases to validate retrieval.")
-            test_queries = [
+            st.caption("Predefined test queries")
+            for q in [
                 "What is the leave policy?",
                 "Do I get health benefits?",
-                "Can I work remotely?",
-                "Who is the CEO?" # Out of scope test
-            ]
-            st.write("Test Questions:")
-            for q in test_queries:
-                if st.button(f"▶️ {q}", key=q):
-                    st.session_state.query_input = q
+                "Can I work from a coffee shop?",
+                "Who is the CEO?"
+            ]:
+                if st.button(q):
+                    st.session_state.eval_query = q
 
-    # CHAT INTERFACE
-    if 'messages' not in st.session_state:
+    # ---------------- CHAT UI ----------------
+    if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display Chat History
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            # Display Category
-            if "category" in message:
-                st.markdown(f'<span class="category-tag">{message["category"]}</span>', unsafe_allow_html=True)
-            
-            st.markdown(message["content"])
-            
-            # Display Sources with Scores (Feature 1)
-            if "sources" in message:
-                with st.expander("🔍 View Retrieval Details & Sources"):
-                    for i, (doc, score) in enumerate(message["sources"]):
-                        st.markdown(f"**Document {i+1}** | Distance: `{score:.4f}` *(Lower is better)*")
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if "category" in msg:
+                st.markdown(
+                    f'<span class="category-tag">{msg["category"]}</span>',
+                    unsafe_allow_html=True
+                )
+            st.markdown(msg["content"])
+
+            if "sources" in msg and msg["sources"]:
+                with st.expander("🔍 Retrieval Details"):
+                    for i, (doc, score) in enumerate(msg["sources"]):
+                        st.markdown(f"**Document {i+1}** | Distance: `{score:.4f}`")
                         st.caption(doc.page_content[:200] + "...")
 
-    # User Input Handling
-    # Check if Eval mode injected a query
-    if 'query_input' in st.session_state:
-        prompt = st.session_state.query_input
-        del st.session_state.query_input
+    if "eval_query" in st.session_state:
+        user_query = st.session_state.pop("eval_query")
     else:
-        prompt = st.chat_input("Ask a question...")
+        user_query = st.chat_input("Ask about HR policies...")
 
-    if prompt:
-        if 'api_key' not in st.session_state:
-            st.error("Please enter API Key in sidebar.")
-        else:
-            # User Message
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
+    if user_query:
+        st.session_state.messages.append({
+            "role": "user",
+            "content": user_query
+        })
 
-            # AI Response
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        answer, sources, category = user_input(prompt)
-                        
-                        # Display
-                        st.markdown(f'<span class="category-tag">{category}</span>', unsafe_allow_html=True)
-                        st.markdown(answer)
-                        
-                        # Sources Expander
-                        if sources:
-                            with st.expander("🔍 View Retrieval Details & Sources"):
-                                for i, (doc, score) in enumerate(sources):
-                                    st.markdown(f"**Document {i+1}** | Distance: `{score:.4f}`")
-                                    st.caption(doc.page_content[:200] + "...")
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                answer, sources, category = answer_question(user_query)
 
-                        # Save History
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": answer, 
-                            "category": category,
-                            "sources": sources
-                        })
+                st.markdown(
+                    f'<span class="category-tag">{category}</span>',
+                    unsafe_allow_html=True
+                )
+                st.markdown(answer)
 
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                if sources:
+                    with st.expander("🔍 Retrieval Details"):
+                        for i, (doc, score) in enumerate(sources):
+                            st.markdown(f"**Document {i+1}** | Distance: `{score:.4f}`")
+                            st.caption(doc.page_content[:200] + "...")
 
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "category": category,
+                    "sources": sources
+                })
+
+# --------------------------------------------------
 if __name__ == "__main__":
     main()
