@@ -6,6 +6,14 @@ This project was built as part of an **AI Engineer interview assignment** and fo
 
 ---
 
+## 🚀 Live Demo
+
+**[🚀 Live Demo: https://ai-powered-hr-app-assistant.streamlit.app/](https://ai-powered-hr-app-assistant.streamlit.app/)**
+
+Try the application instantly in your browser!
+
+---
+
 ## ✨ Key Features
 
 ### 🔍 Intelligent HR Q&A (RAG)
@@ -107,7 +115,7 @@ Answer + Category + Sources
 
 ```bash
 git clone https://github.com/saoud30/AI-Powered-HR-Onboarding-Assistant.git
-cd HR-RAG-ASSISTANT
+cd AI-Powered-HR-Onboarding-Assistant
 ```
 
 ### 2️⃣ Install Dependencies
