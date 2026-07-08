@@ -172,7 +172,4 @@ It is production-aligned (not production-hardened) and demonstrates strong funda
 
 ---
 
-## 👤 Author
 
-Built by Mohd Saoud  
-AI Engineer | RAG Systems | Applied ML
